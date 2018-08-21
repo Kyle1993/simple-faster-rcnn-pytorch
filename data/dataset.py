@@ -96,18 +96,25 @@ class Transform(object):
 
 
 class Dataset:
+    '''
+    Returns:
+        img:
+        bbox:[R,4]
+        label:[R,]
+        scale:float
+    '''
     def __init__(self, opt):
         self.opt = opt
         self.db = VOCBboxDataset(opt.voc_data_dir)
         self.tsf = Transform(opt.min_size, opt.max_size)
 
     def __getitem__(self, idx):
-        ori_img, bbox, label, difficult = self.db.get_example(idx)
+        ori_img, bbox, label, difficult = self.db.get_example(idx)   # 获取原始图像
 
-        img, bbox, label, scale = self.tsf((ori_img, bbox, label))
+        img, bbox, label, scale = self.tsf((ori_img, bbox, label))   # 保证短边大于min或者长边小于max
         # TODO: check whose stride is negative to fix this instead copy all
         # some of the strides of a given numpy array are negative.
-        return img.copy(), bbox.copy(), label.copy(), scale
+        return img.copy(), bbox.copy(), label.copy(), scale          # scale是transform的比例
 
     def __len__(self):
         return len(self.db)

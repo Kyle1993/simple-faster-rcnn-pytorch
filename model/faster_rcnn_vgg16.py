@@ -111,6 +111,7 @@ class VGG16RoIHead(nn.Module):
         self.n_class = n_class
         self.roi_size = roi_size
         self.spatial_scale = spatial_scale
+        # 这里比较特殊的就是这个ROIPooling层,原理和SSPNet类似,可以把不同大小的图片pooling成大小相同的矩阵
         self.roi = RoIPooling2D(self.roi_size, self.roi_size, self.spatial_scale)
 
     def forward(self, x, rois, roi_indices):

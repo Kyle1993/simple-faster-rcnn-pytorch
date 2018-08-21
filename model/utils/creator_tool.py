@@ -91,17 +91,28 @@ class ProposalTargetCreator(object):
         """
         n_bbox, _ = bbox.shape
 
+        # roi是rpn网络生成的候选区域
+        # bbox是ground truth
+        # 这里要注意的是bbox区域也可以作为训练样本，所以这里将roi和bbox concat起来
         roi = np.concatenate((roi, bbox), axis=0)
 
-        pos_roi_per_image = np.round(self.n_sample * self.pos_ratio)
+        pos_roi_per_image = np.round(self.n_sample * self.pos_ratio)  # 采样的正样本数量
+        # 每个roi对应每个bbox的IOU
         iou = bbox_iou(roi, bbox)
+
+        # 每个roi对应iou最大的bbox的index
         gt_assignment = iou.argmax(axis=1)
+        # 每个roi对应最大iou的值
         max_iou = iou.max(axis=1)
-        # Offset range of classes from [0, n_fg_class - 1] to [1, n_fg_class].
-        # The label with value 0 is the background.
+
+        # 每个roi的label,0为背景类,所以别的类别都+1
         gt_roi_label = label[gt_assignment] + 1
 
+        # 到这里我们得到了所有roi(包括bbox)的最大IOU值和他们的类别标签
+        # 在标注类别标签的时候我们并不关心它与bbox最接近
+
         # Select foreground RoIs as those with >= pos_iou_thresh IoU.
+        # 在大于IOU阈值的roi中选取正样本，为什么正样本比例设的这么低???,只有0.25
         pos_index = np.where(max_iou >= self.pos_iou_thresh)[0]
         pos_roi_per_this_image = int(min(pos_roi_per_image, pos_index.size))
         if pos_index.size > 0:
@@ -110,6 +121,7 @@ class ProposalTargetCreator(object):
 
         # Select background RoIs as those within
         # [neg_iou_thresh_lo, neg_iou_thresh_hi).
+        # 在IOU区间内选择负样本,这里的iou区间是[0-0.5],我觉得0.5还挺高的???
         neg_index = np.where((max_iou < self.neg_iou_thresh_hi) &
                              (max_iou >= self.neg_iou_thresh_lo))[0]
         neg_roi_per_this_image = self.n_sample - pos_roi_per_this_image
@@ -120,16 +132,20 @@ class ProposalTargetCreator(object):
                 neg_index, size=neg_roi_per_this_image, replace=False)
 
         # The indices that we're selecting (both positive and negative).
+        # 正类保留分类,负类标签置0
         keep_index = np.append(pos_index, neg_index)
         gt_roi_label = gt_roi_label[keep_index]
         gt_roi_label[pos_roi_per_this_image:] = 0  # negative labels --> 0
         sample_roi = roi[keep_index]
 
         # Compute offsets and scales to match sampled RoIs to the GTs.
+        # 计算4个修正量作为位置回归的ground truth
         gt_roi_loc = bbox2loc(sample_roi, bbox[gt_assignment[keep_index]])
         gt_roi_loc = ((gt_roi_loc - np.array(loc_normalize_mean, np.float32)
                        ) / np.array(loc_normalize_std, np.float32))
 
+        # 这里似乎并不能保证选取出来的sample_roi数目一定是128个,因为极端情况下可以有很多不符合条件的roi,即不能选作正样本也不能选做负样本
+        # 具体训练时由于候选框很多,可能一般都能填满128吧
         return sample_roi, gt_roi_loc, gt_roi_label
 
 
@@ -200,15 +216,23 @@ class AnchorTargetCreator(object):
         img_H, img_W = img_size
 
         n_anchor = len(anchor)
+        # inside_index:位置不出界的合法anchor
         inside_index = _get_inside_index(anchor, img_H, img_W)
         anchor = anchor[inside_index]
-        argmax_ious, label = self._create_label(
-            inside_index, anchor, bbox)
+
+        # argmax_ious:与anchor最接近的bbox索引
+        #   比如：anchor0与bbox2最接近,anchor1与bbox0最接近...
+        #   那么argmax_ious = [2,0,...]
+        # label:大于IOU阈值的标记为正样本1,小于IOU阈值的标记为负样本0,还有一部分被丢弃掉的样本标记为-1
+        argmax_ious, label = self._create_label(inside_index, anchor, bbox)
 
         # compute bounding box regression targets
+        # 将位置框转换为修正值，作为回归目标
         loc = bbox2loc(anchor, bbox[argmax_ious])
 
         # map up to original set of anchors
+        # 由于RPN网络生成了所有anchor(9*hh*ww个)的预测,所以这里也生成所有anchor的目标
+        # 所以要unmap回原来的数据中,不合法和不需要的样本通过将其label=-1的方式标注出来
         label = _unmap(label, n_anchor, inside_index, fill=-1)
         loc = _unmap(loc, n_anchor, inside_index, fill=0)
 
@@ -226,6 +250,8 @@ class AnchorTargetCreator(object):
         label[max_ious < self.neg_iou_thresh] = 0
 
         # positive label: for each gt, anchor with highest iou
+        # 这一步是否多余?如果gt_argmax_ious都不被包含在max_ious >= self.pos_iou_thresh里,
+        # 就说明最大的IOU值都不满足大于阈值的条件,label是否还应该被设为1？
         label[gt_argmax_ious] = 1
 
         # positive label: above threshold IOU
@@ -251,19 +277,18 @@ class AnchorTargetCreator(object):
 
     def _calc_ious(self, anchor, bbox, inside_index):
         # ious between the anchors and the gt boxes
-        ious = bbox_iou(anchor, bbox)
-        argmax_ious = ious.argmax(axis=1)
-        max_ious = ious[np.arange(len(inside_index)), argmax_ious]
-        gt_argmax_ious = ious.argmax(axis=0)
-        gt_max_ious = ious[gt_argmax_ious, np.arange(ious.shape[1])]
-        gt_argmax_ious = np.where(ious == gt_max_ious)[0]
+        ious = bbox_iou(anchor, bbox)                               # [nanchor,nbbox],以下的最接近表示IOU最大
+        argmax_ious = ious.argmax(axis=1)                           # 每个anchor,与其最接近的bbox的索引,[nanchor,]
+        max_ious = ious[np.arange(len(inside_index)), argmax_ious]  # 每个anchor,与其最接近的bbox的IOU值,[nanchor,]
+        gt_argmax_ious = ious.argmax(axis=0)                        # 每个bbox,与其最接近的anchor的索引,[nbbox,]
+        gt_max_ious = ious[gt_argmax_ious, np.arange(ious.shape[1])]# 每个bbox,与其最接近的anchor的IOU值[nbbox,]
+        gt_argmax_ious = np.where(ious == gt_max_ious)[0]           # 这里得到的值不是与原来的gt_argmax_ious一样么?
 
         return argmax_ious, max_ious, gt_argmax_ious
 
 
 def _unmap(data, count, index, fill=0):
-    # Unmap a subset of item (data) back to the original set of items (of
-    # size count)
+    # Unmap a subset of item (data) back to the original set of items (of size count)
 
     if len(data.shape) == 1:
         ret = np.empty((count,), dtype=data.dtype)
@@ -392,16 +417,19 @@ class ProposalCreator:
             n_post_nms = self.n_test_post_nms
 
         # Convert anchors into proposal via bbox transformations.
-        # roi = loc2bbox(anchor, loc)
+        # 根据anchor_bbox和他的修正量loc生成修正后的bbox
+        # roi:[n_anchor,4]
         roi = loc2bbox(anchor, loc)
 
         # Clip predicted boxes to image.
+        # 将roi的边界clip成原始图像边界
         roi[:, slice(0, 4, 2)] = np.clip(
             roi[:, slice(0, 4, 2)], 0, img_size[0])
         roi[:, slice(1, 4, 2)] = np.clip(
             roi[:, slice(1, 4, 2)], 0, img_size[1])
 
         # Remove predicted boxes with either height or width < threshold.
+        # 删除长或宽小于minsize的roi
         min_size = self.min_size * scale
         hs = roi[:, 2] - roi[:, 0]
         ws = roi[:, 3] - roi[:, 1]
@@ -411,6 +439,8 @@ class ProposalCreator:
 
         # Sort all (proposal, score) pairs by score from highest to lowest.
         # Take top pre_nms_topN (e.g. 6000).
+        # order是score按降序排列后的index
+        # 获得到的是score前n_pre_nms大的roi
         order = score.ravel().argsort()[::-1]
         if n_pre_nms > 0:
             order = order[:n_pre_nms]
@@ -421,6 +451,7 @@ class ProposalCreator:
 
         # unNOTE: somthing is wrong here!
         # TODO: remove cuda.to_gpu
+        # 非最大值抑制 合并anchor,选取最大的n_post_nms个作为最终的roi
         keep = non_maximum_suppression(
             cp.ascontiguousarray(cp.asarray(roi)),
             thresh=self.nms_thresh)
