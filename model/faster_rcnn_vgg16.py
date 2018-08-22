@@ -102,6 +102,7 @@ class VGG16RoIHead(nn.Module):
         super(VGG16RoIHead, self).__init__()
 
         self.classifier = classifier
+        # 这里为什么要对每个类都进行loc的回归？
         self.cls_loc = nn.Linear(4096, n_class * 4)
         self.score = nn.Linear(4096, n_class)
 
